@@ -56,7 +56,7 @@ Construir un pipeline reproducible que permita:
 
 ### Bronze
 
-Contendrá una representación fiel de los archivos originales, conservando los datos tal como llegan desde la fuente.
+Contendrá una representación fiel de los archivos originales. Los valores de negocio se conservarán sin transformaciones semánticas; únicamente se agregarán metadatos de trazabilidad y se normalizarán nombres de columnas para garantizar compatibilidad con Delta Lake.
 
 Tablas previstas:
 
@@ -69,8 +69,7 @@ Tablas previstas:
 
 Contendrá los datos limpios y estandarizados. Entre otras transformaciones se espera:
 
-- Normalización de nombres de columnas.
-- Estandarización de `Croquis` / `Corquis` a `croquis`.
+- Estandarización de nombres y significado de columnas.
 - Conversión de fechas y tipos de datos.
 - Conversión de coordenadas a tipos numéricos.
 - Tratamiento justificado de valores nulos.
@@ -167,7 +166,10 @@ BI / análisis           Machine Learning
 ```text
 accidentalidad-databricks/
 ├── 00_Setup/
+│   └── 00_Configuracion.ipynb
 ├── 01_Exploracion_y_Transformacion/
+│   ├── 01_Ingesta_Bronze.ipynb
+│   └── 02_Transformacion_Silver.ipynb        # se construirá en la siguiente etapa
 ├── 02_Delta_Lake/
 ├── 03_Gobernanza/
 ├── 04_Orquestacion/
@@ -175,6 +177,12 @@ accidentalidad-databricks/
 ├── data/
 └── README.md
 ```
+
+### Organización de notebooks
+
+- `00_Setup/00_Configuracion.ipynb`: parámetros del proyecto, catálogo, schemas Medallion y Volume de archivos raw.
+- `01_Exploracion_y_Transformacion/01_Ingesta_Bronze.ipynb`: validación de archivos fuente, función reutilizable de ingesta, normalización técnica de nombres, escritura Delta y validación de conteos.
+- `01_Exploracion_y_Transformacion/02_Transformacion_Silver.ipynb`: limpieza, tipado, estandarización y controles de calidad de los datos Bronze.
 
 ## Estado
 
