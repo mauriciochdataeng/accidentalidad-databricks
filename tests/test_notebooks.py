@@ -4,11 +4,26 @@ from pathlib import Path
 import unittest
 from unittest.mock import MagicMock
 
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class NotebookValidationTest(unittest.TestCase):
+    @unittest.skipIf(tomllib is None, "Validación TOML requiere Python 3.11 o posterior")
+    def test_shared_environment_dependencies_match_requirements(self):
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+        requirements = {
+            line.strip() for line in (ROOT / "requirements-databricks.txt").read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        self.assertEqual(set(project["project"]["dependencies"]), requirements)
+        self.assertGreaterEqual(int(project["tool"]["databricks"]["environment"]["environment_version"]), 5)
+
     def test_notebooks_are_parseable_and_do_not_embed_runtime_outputs(self):
         notebooks = sorted(ROOT.glob("*/*.ipynb"))
         self.assertEqual(len(notebooks), 7)
@@ -18,7 +33,12 @@ class NotebookValidationTest(unittest.TestCase):
             for index, cell in enumerate(notebook["cells"]):
                 if cell["cell_type"] == "code":
                     with self.subTest(notebook=path.name, cell=index):
-                        ast.parse("".join(cell["source"]))
+                        source = "".join(cell["source"])
+                        # Las celdas magic de Databricks no son sintaxis Python estándar.
+                        if source.startswith(("%pip ", "%uv ")):
+                            command, _, arguments = source.strip().partition(" ")
+                            source = f"get_ipython().run_line_magic({command[1:]!r}, {arguments!r})"
+                        ast.parse(source)
                         self.assertEqual(cell["outputs"], [])
                         self.assertIsNone(cell["execution_count"])
 

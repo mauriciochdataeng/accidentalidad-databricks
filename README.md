@@ -46,11 +46,16 @@ construir features: esa unión podría multiplicar registros por accidente.
    Databricks Runtime 16.4 LTS o posterior, con Python 3.10 o posterior, o un entorno
    serverless que soporte las mismas operaciones. La compatibilidad efectiva debe
    verificarse mediante [la guía de validación](docs/VALIDACION.md).
-3. Para ML y orquestación, instale las dependencias de
-   [requirements-databricks.txt](requirements-databricks.txt) en el cluster o entorno
-   serverless del Job. No instale un Spark independiente sobre Databricks Runtime.
-4. Ejecute `00_Setup/00_Configuracion.ipynb`. Necesita autorización para crear catálogo,
-   schemas y un Volume administrado. Crea `bronze`, `silver`, `gold` y `quality`.
+3. Para compartir dependencias entre notebooks en serverless, abra el Git Folder con
+   **Open in editor** y seleccione **Shared Serverless** en cada notebook. Un administrador
+   debe habilitar **Project-Scoped Shared Compute**; requiere entorno versión 5 o superior.
+   Abra `00_Setup/00_Configuracion.ipynb`: sus primeras celdas localizan
+   [pyproject.toml](pyproject.toml), sincronizan el entorno con `%uv sync` y reinician Python.
+   Los demás notebooks del mismo Git Folder, usuario y compute compartido pueden usar
+   las dependencias sin comandos de instalación adicionales.
+4. Continúe con las celdas de configuración del mismo notebook. Necesita autorización
+   para crear catálogo, schemas y un Volume administrado. Crea `bronze`, `silver`, `gold`
+   y `quality`.
 5. Cargue los cuatro CSV en `/Volumes/<catalog_name>/bronze/raw_files/` siguiendo
    [data/README.md](data/README.md). La procedencia, versión y licencia de los archivos
    originales todavía deben completarse a partir del material del curso o proveedor.
@@ -61,16 +66,25 @@ construir features: esa unión podría multiplicar registros por accidente.
 9. También puede ejecutar ML manualmente después de Silver. El candidato se registra
    sin cambiar Champion. Una promoción exige `promote_champion=true` y superar sus controles.
 
-Si trabaja en un cluster interactivo, puede instalar las dependencias en una celda de
-preparación del entorno, adaptando la ruta al Git Folder:
+El serverless normal mantiene entornos por notebook y no ofrece esta instalación
+compartida. Si no aparece Shared Serverless, su administrador debe habilitar la función;
+la celda `%uv sync` del setup está destinada a Shared Serverless. Consulte los
+[requisitos y el alcance del entorno compartido](https://docs.databricks.com/aws/en/compute/serverless/notebooks/shared-serverless).
 
-```python
-%pip install -r /Workspace/Users/<usuario>/<repositorio>/requirements-databricks.txt
-```
+En un cluster clásico, omita las celdas de sincronización/reinicio del setup e instale
+[requirements-databricks.txt](requirements-databricks.txt) en **Compute > Libraries**
+para compartirlo entre todos los notebooks del cluster. No instale un Spark independiente
+sobre Databricks Runtime. Una sesión ya abierta puede requerir volver a conectarse.
 
-Reinicie Python si el entorno lo solicita antes de ejecutar los notebooks. En Jobs,
-prepare las dependencias en el compute o entorno serverless; la sesión interactiva no
-transfiere automáticamente sus paquetes al Job.
+Los Jobs creados con el SDK del notebook de orquestación necesitan su propio entorno;
+la preparación interactiva no configura automáticamente ese entorno. Para Jobs
+serverless, configure sus dependencias o seleccione el `pyproject.toml` como Project
+environment cuando la opción esté disponible en su workspace.
+
+Mantenga alineadas las dependencias de `pyproject.toml` y `requirements-databricks.txt`.
+`%uv sync` genera o actualiza `uv.lock`: conserve y versione el lock generado en su
+entorno validado para reproducir esa resolución. No se incluye un lock sin haberlo
+resuelto y comprobado en Databricks.
 
 El rango de dependencias expresa compatibilidad prevista, no un lock de entorno ya
 certificado. Cada entrenamiento registra las versiones exactas de sus bibliotecas y

@@ -8,6 +8,13 @@ Folder completo. No use datos reales en un repositorio público.
 
 - Registre el commit y los cambios locales, la versión de Runtime o del entorno
   serverless, las dependencias instaladas y la identidad ejecutora.
+- En serverless, habilite Shared Serverless y conecte los notebooks del Git Folder al
+  mismo compute compartido. El setup sincroniza `pyproject.toml` con `%uv sync`.
+  Después de ejecutarlo, compruebe desde ML, sin celdas de instalación, que se pueden
+  importar `mlflow`, `sklearn` y `databricks.sdk`. Registre el `uv.lock` generado.
+  Esta comprobación requiere entorno versión 5 o superior y la función habilitada por
+  un administrador. En un cluster clásico, instale requirements como biblioteca del
+  cluster y omita las celdas de sincronización/reinicio del setup.
 - Ejecute setup con un `catalog_name` de prueba. Compruebe schemas y el Volume.
 - Prepare los cuatro CSV completos según `data/README.md` y registre sus hashes.
 - Verifique que el compute y su identidad puedan leer el Volume, escribir tablas en
