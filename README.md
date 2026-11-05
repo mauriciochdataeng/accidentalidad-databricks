@@ -1,346 +1,263 @@
 # accidentalidad-databricks
 
-Proyecto final del curso de Databricks de la Universidad de los Andes.
+Proyecto académico de ingeniería de datos en Databricks sobre accidentalidad vial de
+Barranquilla. Implementa arquitectura Medallion, calidad de datos, Delta Lake,
+Unity Catalog, Jobs y clasificación de accidentes con víctimas mediante MLflow.
 
-## Descripción
+El código está preparado para ejecutarse en Databricks. Los CSV originales, resultados
+de Jobs y métricas certificadas no están incluidos en este repositorio. Las comprobaciones
+locales no sustituyen la validación con datos reales en el workspace.
 
-Este proyecto construye una solución de datos end-to-end en Databricks a partir de información histórica de accidentalidad vial de Barranquilla.
+## Arquitectura
 
-La implementación cubre:
+```text
+Cuatro CSV completos e inmutables
+           |
+Unity Catalog Volume: bronze.raw_files
+           |
+Lectura + contrato + controles Bronze
+           |
+Tablas Delta Bronze
+           |
+Lectura de versiones fijas + transformación + controles Silver
+           |
+Tablas Delta Silver
+           |
+Gold: features_accidentalidad + controles
+           |
+Entrenamiento 2018–2020 -> selección con validación 2021
+           |
+Prueba final 2022 -> MLflow -> versión candidata en Unity Catalog
+           |
+Promoción explícita con umbrales -> alias Champion
 
-- arquitectura Medallion con capas Bronze, Silver y Gold;
-- ingesta y transformación con PySpark;
-- tablas Delta administradas en Unity Catalog;
-- controles de calidad e integridad entre fuentes;
-- `MERGE INTO`, Time Travel, historial y `OPTIMIZE` con Delta Lake;
-- gobernanza y privilegios con Unity Catalog;
-- orquestación con Databricks Jobs;
-- construcción de un dataset Gold para Machine Learning;
-- entrenamiento y comparación de modelos;
-- tracking de experimentos con MLflow;
-- registro del mejor modelo en Unity Catalog Model Registry.
+Auditoría transversal: quality.check_results y quality.orphan_<dataset>
+Orquestación: Bronze -> Silver -> Gold/ML opcional
+```
 
-## Fuentes de datos
+Se mantiene el grano de cada fuente. Vehículos y víctimas no se unen directamente para
+construir features: esa unión podría multiplicar registros por accidente.
 
-El proyecto parte de cuatro archivos CSV:
+## Preparación desde cero
 
-| Dataset | Grano | Registros |
+1. Importe el repositorio **completo** en un Git Folder de Databricks. Los notebooks
+   importan el paquete Python `accidentalidad/` desde esa raíz.
+2. Use un workspace y compute con Unity Catalog. El objetivo de compatibilidad es
+   Databricks Runtime 16.4 LTS o posterior, con Python 3.10 o posterior, o un entorno
+   serverless que soporte las mismas operaciones. La compatibilidad efectiva debe
+   verificarse mediante [la guía de validación](docs/VALIDACION.md).
+3. Para ML y orquestación, instale las dependencias de
+   [requirements-databricks.txt](requirements-databricks.txt) en el cluster o entorno
+   serverless del Job. No instale un Spark independiente sobre Databricks Runtime.
+4. Ejecute `00_Setup/00_Configuracion.ipynb`. Necesita autorización para crear catálogo,
+   schemas y un Volume administrado. Crea `bronze`, `silver`, `gold` y `quality`.
+5. Cargue los cuatro CSV en `/Volumes/<catalog_name>/bronze/raw_files/` siguiendo
+   [data/README.md](data/README.md). La procedencia, versión y licencia de los archivos
+   originales todavía deben completarse a partir del material del curso o proveedor.
+6. Ejecute Bronze y después Silver. Revise sus controles y las anomalías aceptadas.
+7. Ejecute opcionalmente las demostraciones Delta y de gobernanza.
+8. Despliegue el Job con el notebook de orquestación. Use `run_job=true` para ejecutarlo
+   y verificar su resultado final; `include_ml=true` incorpora Gold y entrenamiento.
+9. También puede ejecutar ML manualmente después de Silver. El candidato se registra
+   sin cambiar Champion. Una promoción exige `promote_champion=true` y superar sus controles.
+
+Si trabaja en un cluster interactivo, puede instalar las dependencias en una celda de
+preparación del entorno, adaptando la ruta al Git Folder:
+
+```python
+%pip install -r /Workspace/Users/<usuario>/<repositorio>/requirements-databricks.txt
+```
+
+Reinicie Python si el entorno lo solicita antes de ejecutar los notebooks. En Jobs,
+prepare las dependencias en el compute o entorno serverless; la sesión interactiva no
+transfiere automáticamente sus paquetes al Job.
+
+El rango de dependencias expresa compatibilidad prevista, no un lock de entorno ya
+certificado. Cada entrenamiento registra las versiones exactas de sus bibliotecas y
+las fija en los requisitos del modelo serializado. Conserve también la versión de
+Runtime o del entorno serverless usado en su evidencia de ejecución.
+
+## Fuentes y contrato de carga
+
+| Archivo | Grano | Filas del lote de referencia |
 |---|---|---:|
-| `accidentes.csv` | una fila por accidente | 23,212 |
-| `causas.csv` | una fila por accidente | 23,212 |
-| `vehiculos.csv` | una fila por vehículo involucrado | 46,128 |
-| `victimas.csv` | una fila por víctima | 11,328 |
-
-La columna `Croquis` —o `Corquis` en algunos archivos de origen— identifica el accidente y permite relacionar las distintas fuentes.
-
-Los datasets tienen granos diferentes y se mantienen separados para evitar joins que multipliquen filas de forma incorrecta, especialmente entre vehículos y víctimas.
-
-## Arquitectura implementada
-
-```text
-CSV originales
-     |
-     v
-Unity Catalog Volume
-     |
-     v
-Bronze
-     |
-     v
-Silver
-     |
-     v
-Gold ML: features_accidentalidad
-     |
-     v
-Machine Learning
-     |
-     v
-MLflow Tracking
-     |
-     v
-Unity Catalog Model Registry
-     |
-     v
-Alias Champion
-```
-
-De forma transversal:
-
-```text
-Unity Catalog  -> catálogo, schemas, permisos y trazabilidad
-Delta Lake     -> MERGE, Time Travel, historial y OPTIMIZE
-Databricks Jobs -> orquestación Bronze -> Silver
-Git Folder     -> versionamiento con GitHub
-```
-
-## 1. Setup y Unity Catalog
-
-El proyecto utiliza el catálogo:
-
-```text
-accidentalidad_databricks
-├── bronze
-├── silver
-└── gold
-```
-
-También se utiliza un Unity Catalog Volume para almacenar los archivos fuente:
-
-```text
-/Volumes/accidentalidad_databricks/bronze/raw_files
-```
-
-El notebook de configuración crea el catálogo y los schemas Medallion de forma reproducible.
-
-## 2. Capa Bronze
-
-Las cuatro fuentes se ingieren como tablas Delta:
-
-- `bronze.accidentes`
-- `bronze.causas`
-- `bronze.vehiculos`
-- `bronze.victimas`
-
-Principios aplicados:
-
-- los valores de negocio se conservan sin transformación semántica;
-- `inferSchema=False` para preservar inicialmente los datos como texto;
-- se normalizan únicamente nombres de columnas incompatibles con Delta;
-- `Croquis` / `Corquis` se normaliza técnicamente a `croquis`;
-- se conserva `_c0` en Bronze como parte del archivo recibido;
-- se agregan `_source_file` y `_ingestion_timestamp` para trazabilidad;
-- `_metadata.file_path` se utiliza como alternativa compatible con Unity Catalog.
-
-La ingesta se implementa mediante una función reutilizable para los cuatro datasets.
-
-## 3. Capa Silver
-
-La capa Silver limpia, tipa y estandariza los datos sin alterar el grano de las fuentes.
-
-Transformaciones principales:
-
-- eliminación de `_c0`;
-- fechas convertidas a `DATE`;
-- año, mes, día, edad, heridos y muertos convertidos a tipos numéricos;
-- coordenadas con coma decimal convertidas a `DOUBLE`;
-- limpieza de cadenas vacías;
-- normalización de categorías;
-- corrección del problema de encoding `se¤ales` -> `señales` en causas;
-- renombre semántico de campos ambiguos de víctimas;
-- conservación de metadatos de trazabilidad;
-- agregado de `_silver_transformation_timestamp`.
-
-### Validaciones de calidad
-
-Los conteos se conservaron completamente entre Bronze y Silver:
-
-| Tabla | Bronze | Silver | Resultado |
-|---|---:|---:|---|
-| accidentes | 23,212 | 23,212 | OK |
-| causas | 23,212 | 23,212 | OK |
-| vehiculos | 46,128 | 46,128 | OK |
-| victimas | 11,328 | 11,328 | OK |
-
-También se validó que:
-
-- no existen `croquis` nulos;
-- `accidentes` tiene 23,212 `croquis` distintos;
-- `causas` tiene 23,212 `croquis` distintos;
-- `vehiculos` tiene 23,215 `croquis` distintos;
-- `victimas` contiene 7,758 accidentes distintos;
-- las conversiones de fechas, numéricos y coordenadas no introdujeron nuevos valores nulos;
-- causas no contiene accidentes huérfanos;
-- se identificaron 3 `croquis` en vehículos sin accidente asociado, conservados y documentados como hallazgo de calidad;
-- para los 23,212 accidentes, la cantidad de registros de víctimas coincide con `nro_heridos + numero_muertos`.
-
-## 4. Delta Lake
-
-El notebook de Delta Lake utiliza una tabla de demostración independiente derivada de `silver.accidentes`, evitando modificar la tabla Silver original.
-
-Se demuestra:
-
-### MERGE INTO
-
-Se simula una carga incremental con dos escenarios:
-
-- un `croquis` existente se actualiza;
-- un `croquis` nuevo se inserta.
-
-Esto representa un patrón de **upsert** (`UPDATE + INSERT`) útil para cargas incrementales reales.
-
-### Historial y Time Travel
-
-Se utiliza `DESCRIBE HISTORY` para inspeccionar las versiones de la tabla y Time Travel para consultar el estado previo al `MERGE`.
-
-### OPTIMIZE
-
-Se ejecuta `OPTIMIZE` para demostrar compactación física de archivos Delta. En este dataset su beneficio de rendimiento es limitado por el volumen, pero representa una práctica relevante en tablas incrementales de mayor escala.
-
-## 5. Gobernanza con Unity Catalog
-
-El proyecto utiliza un catálogo propio y los schemas Medallion para separar responsabilidades y niveles de procesamiento.
-
-El notebook de gobernanza:
-
-- identifica el principal actual con `current_user()`;
-- aplica `USE CATALOG`;
-- aplica `USE SCHEMA`;
-- aplica `SELECT` sobre Silver;
-- verifica los privilegios mediante `SHOW GRANTS`;
-- documenta el principio de mínimo privilegio.
-
-En un entorno empresarial, estos privilegios deberían asignarse preferiblemente a grupos en lugar de usuarios individuales.
-
-## 6. Orquestación
-
-Se crea programáticamente un Databricks Job llamado:
-
-```text
-accidentalidad_barranquilla_pipeline
-```
-
-DAG implementado:
-
-```text
-bronze_ingestion
-       |
-       v
-silver_transformation
-```
-
-La tarea Silver depende explícitamente de que la ingesta Bronze termine correctamente.
-
-El Job fue ejecutado exitosamente de extremo a extremo.
-
-## 7. Gold para Machine Learning
-
-Se crea la tabla:
-
-```text
-gold.features_accidentalidad
-```
-
-Su grano es una fila por accidente.
-
-### Variable objetivo
-
-```text
-tiene_victimas = 0 -> accidente con solo daños
-tiene_victimas = 1 -> accidente con heridos o muertos
-```
-
-El problema se plantea como clasificación al momento conceptual del registro del accidente, no como predicción de que un accidente vaya a ocurrir.
-
-### Prevención de data leakage
-
-No se utilizan como features variables que revelan directamente el resultado, entre ellas:
-
-- `gravedad`;
-- `nro_heridos`;
-- `numero_muertos`;
-- información de la tabla de víctimas.
-
-Las features utilizadas incluyen contexto temporal, geográfico y de clase de accidente.
-
-### Separación temporal
-
-La evaluación utiliza:
-
-- entrenamiento: 2018-2021;
-- prueba: 2022.
-
-Se utiliza un periodo posterior como test para aproximar mejor un escenario real de generalización temporal.
-
-## 8. Machine Learning y MLflow
-
-Se entrenan y comparan dos candidatos:
-
-- Logistic Regression;
-- Random Forest.
-
-Para cada modelo se registran en MLflow:
-
-- parámetros;
-- accuracy;
-- precision;
-- recall;
-- F1;
-- ROC-AUC;
-- reporte de clasificación;
-- modelo serializado con firma e input example.
-
-El mejor modelo se selecciona por **F1** y se registra en Unity Catalog Model Registry como:
-
-```text
-accidentalidad_databricks.gold.modelo_riesgo_victimas
-```
-
-La versión seleccionada recibe el alias:
-
-```text
-Champion
-```
-
-Finalmente, el notebook vuelve a cargar el modelo mediante el alias y ejecuta una inferencia de validación.
-
-> Las métricas exactas de la ejecución se consultan en el experimento de MLflow. No se fijan en este README para evitar documentar valores que cambien cuando el entrenamiento se vuelva a ejecutar.
-
-## Estructura del repositorio
-
-```text
-accidentalidad-databricks/
-├── 00_Setup/
-│   └── 00_Configuracion.ipynb
-├── 01_Exploracion_y_Transformacion/
-│   ├── 01_Ingesta_Bronze.ipynb
-│   └── 02_Transformacion_Silver.ipynb
-├── 02_Delta_Lake/
-│   └── 02_Delta_Lake.ipynb
-├── 03_Gobernanza/
-│   └── 03_Gobernanza.ipynb
-├── 04_Orquestacion/
-│   └── 04_Orquestacion.ipynb
-├── 05_Machine_Learning/
-│   └── 05_Machine_Learning.ipynb
-├── data/
-└── README.md
-```
-
-## Orden recomendado de ejecución
-
-```text
-1. 00_Setup/00_Configuracion.ipynb
-2. 01_Exploracion_y_Transformacion/01_Ingesta_Bronze.ipynb
-3. 01_Exploracion_y_Transformacion/02_Transformacion_Silver.ipynb
-4. 02_Delta_Lake/02_Delta_Lake.ipynb
-5. 03_Gobernanza/03_Gobernanza.ipynb
-6. 04_Orquestacion/04_Orquestacion.ipynb
-7. 05_Machine_Learning/05_Machine_Learning.ipynb
-```
-
-## Cobertura de la rúbrica
-
-| Módulo | Evidencia implementada | Estado |
+| accidentes.csv | Accidente | 23212 |
+| causas.csv | Causa por accidente en este lote | 23212 |
+| vehiculos.csv | Vehículo involucrado | 46128 |
+| victimas.csv | Víctima | 11328 |
+
+Los conteos son valores de referencia del proyecto original, no resultados calculados
+en esta revisión. `croquis` relaciona las fuentes; los encabezados originales `Croquis`
+y `Corquis` se normalizan según cada archivo.
+
+**El pipeline usa reemplazo de instantánea completa.** Bronze y Silver escriben con
+`overwrite`. Entregar solo las filas nuevas eliminaría el histórico de la versión
+actual. La demostración de `MERGE` es independiente y no convierte la ingesta en incremental.
+Mantenga los archivos raw inmutables durante toda la ejecución.
+
+Para un lote completo diferente, desactive `enforce_reference_counts` y revise las reglas
+que dependan del contrato. Use un catálogo distinto por entorno: `entorno` es descriptivo
+y no modifica automáticamente el nombre del catálogo.
+
+## Calidad y publicación
+
+Bronze verifica archivos, encabezados, claves presentes, datasets no vacíos y, por defecto,
+conteos de referencia. Lee los datos como texto con `FAILFAST`, normaliza encabezados y
+agrega archivo de origen, timestamp e identificador de ingesta.
+
+Silver lee versiones fijas de las cuatro tablas Bronze y:
+
+- elimina `_c0`, limpia texto y normaliza categorías;
+- convierte fechas con `try_to_timestamp` y coordenadas con coma decimal;
+- valida conservación de filas, claves presentes y unicidad en accidentes/causas;
+- detecta pérdidas al convertir, fracciones en conteos/edad y valores fuera de dominio;
+- comprueba coherencia del calendario y coordenadas numéricas dentro de límites globales;
+- valida integridad referencial y concilia víctimas con heridos y muertos.
+
+Los controles se evalúan sobre los DataFrames candidatos **antes de publicar Silver**.
+`quality.check_results` guarda ejecución, capa, dataset, regla, resultado, severidad,
+detalle y fecha. Un fallo `ERROR` lanza una excepción después de persistir el reporte;
+un `WARN` conserva la anomalía sin bloquear. Si falla la escritura de auditoría, tampoco
+se publica la capa.
+
+Causas y víctimas no admiten accidentes huérfanos. Vehículos permite hasta 3 claves
+huérfanas por defecto, reproduciendo la tolerancia documentada del lote académico.
+Se conservan sus filas en Silver y se copian a `quality.orphan_vehiculos`. La tolerancia
+es cuantitativa: **no confirma que sean las mismas tres claves históricas**. Use
+`max_vehicle_orphans=0` para exigir integridad estricta.
+
+La validación previa evita publicar datos conocidos como inválidos. Las escrituras de
+las cuatro tablas son transacciones Delta individuales, **no una transacción conjunta**.
+Un fallo de infraestructura durante la publicación puede dejar una capa parcialmente
+actualizada. El Job fallará y debe repetirse con la misma instantánea raw después de
+resolverlo; no consuma una ejecución fallida como una entrega completa. Mantenga un
+único escritor por catálogo, incluidas las ejecuciones manuales.
+
+## Delta Lake
+
+`02_Delta_Lake.ipynb` recrea exclusivamente `silver.accidentes_delta_demo` a partir de
+accidentes. Demuestra actualización e inserción con `MERGE`, historial, Time Travel y
+`OPTIMIZE`. Falla si los resultados finales o el estado histórico no coinciden con lo
+esperado. Esta tabla de demostración no alimenta Gold y su historial se reinicia al
+recrear la demo.
+
+## Gobernanza
+
+El notebook inspecciona permisos por defecto. Para conceder lectura de Silver, un
+administrador especifica un grupo de cuenta existente en `reader_group` y ejecuta con
+`apply_grants=true`. Concede `USE CATALOG`, `USE SCHEMA` y `SELECT`; no se concede
+lectura automáticamente al usuario propietario como prueba de aislamiento.
+
+Después, un miembro lector ejecuta con `apply_grants=false` y `verify_reader=true`.
+La prueba exige lectura y denegación de una inserción sin filas. Otros errores se
+propagan. Si la escritura está permitida por propiedad u otros privilegios heredados,
+la comprobación falla. No se crean grupos ni se revocan permisos existentes.
+
+Silver conserva nombres, placas e identificadores originales. Seleccione los miembros
+del grupo según la autorización sobre esas fuentes; para consumidores más amplios,
+prepare vistas con los campos permitidos antes de conceder acceso.
+
+## Orquestación
+
+El Job se llama `accidentalidad_barranquilla_pipeline_<catalog_name>` y contiene
+`bronze_ingestion -> silver_transformation`, con `gold_and_training` opcional.
+
+- Crear o volver a desplegar sincroniza la definición completa mediante `jobs.reset`.
+- Los Jobs duplicados y una ejecución activa bloquean el despliegue.
+- El Job antiguo sin sufijo de catálogo no se elimina ni migra automáticamente.
+- Se permite una ejecución concurrente; las tareas tienen timeout y reintentos acotados.
+- ML no tiene reintento automático porque registrar una versión es una operación con efecto persistente.
+- `run_job=false` solo despliega; `true` inicia, espera y exige resultado `SUCCESS`.
+- El Job siempre envía `promote_champion=false` a ML.
+
+La definición del repositorio es la fuente de configuración del Job: el despliegue
+reemplaza también ajustes manuales que no estén representados en ella. Añada allí las
+notificaciones y demás opciones operativas que necesite conservar. `source=WORKSPACE`
+ejecuta los notebooks del Git Folder; fije su revisión y evite editarlo durante una ejecución.
+
+La reconciliación de un Job existente sigue la API oficial de
+[Databricks Jobs](https://databricks-sdk-py.readthedocs.io/en/stable/workspace/jobs/jobs.html).
+
+## Machine Learning
+
+Gold mantiene una fila por accidente. El objetivo `tiene_victimas` deriva de `gravedad`:
+`SOLO DAÑOS=0`, `CON HERIDOS/CON MUERTOS=1`. La gravedad, los conteos de heridos/muertos
+y la tabla de víctimas no se usan como features.
+
+Se utilizan mes, día de semana, hora, localidad, clase de accidente y coordenadas.
+Es una clasificación contextual del accidente: debe comprobarse que cada campo esté
+disponible en el instante previsto de uso; no predice que vaya a ocurrir un accidente.
+
+Gold verifica unicidad, claves, año, horas válidas y etiquetas. Las etiquetas desconocidas
+se auditan y se copian a `quality.unknown_labels`; por defecto bloquean la publicación.
+`max_unknown_labels` permite una tolerancia explícita, siempre contabilizando las exclusiones.
+Antes de `toPandas`, se exige el límite `max_driver_rows` (100000 por defecto).
+
+| Partición | Periodo | Uso |
 |---|---|---|
-| Ingesta y transformación | Bronze + limpieza Silver | ✅ |
-| Delta Lake | MERGE, Time Travel, historial y OPTIMIZE | ✅ |
-| Gobernanza | catálogo propio, schemas Medallion y GRANT documentado | ✅ |
-| Orquestación | Databricks Job con dependencias y ejecución exitosa | ✅ |
-| Machine Learning | modelo entrenado, MLflow Tracking y registro en Unity Catalog | ✅ |
+| Entrenamiento | 2018–2020 | Ajuste del preprocesador y modelos |
+| Validación | 2021 | Selección por F1 y decisión de promoción |
+| Prueba | 2022 | Evaluación final únicamente del candidato seleccionado |
 
-## Trabajo futuro
+Cada partición debe tener filas y ambas clases. Los años fuera del periodo se contabilizan
+y excluyen del entrenamiento/evaluación. Se compara Regresión Logística y Random Forest,
+con imputación, escalado numérico y one-hot de categorías. Cada candidato tiene un
+preprocesador independiente y se compara con un baseline de clase mayoritaria.
 
-El proyecto deja definidos como posibles extensiones:
+MLflow registra hiperparámetros, accuracy, precision, recall, F1, ROC-AUC, average precision
+(`pr_auc`), reportes, firma, ejemplo de entrada, versiones exactas de bibliotecas, hashes de
+código, commit cuando está disponible, exclusiones y versiones Delta de entrada. Los requisitos
+del modelo se registran con versiones exactas mediante
+[MLflow sklearn](https://mlflow.org/docs/latest/api_reference/python_api/mlflow.sklearn.html).
 
-- construir el modelo dimensional Gold analítico (`dim_*` y `fct_*`);
-- incorporar nuevos lotes incrementales reales en lugar de la simulación de `MERGE`;
-- ampliar los controles de calidad y convertirlos en tests automatizados;
-- agregar tuning de hiperparámetros;
-- evaluar drift temporal del modelo;
-- crear un endpoint de Model Serving;
-- extender el Databricks Job para incluir Delta, gobernanza y Machine Learning según las necesidades operativas.
+El candidato elegido conserva su entrenamiento 2018–2020 y se registra como una nueva versión
+de `gold.modelo_riesgo_victimas`. `promote_champion=false` permite registrar e inspeccionar
+sin cambiar el modelo vigente. Con `true`, el candidato debe:
 
-## Estado
+1. Alcanzar `minimum_validation_f1` (0.5 por defecto).
+2. Superar estrictamente el baseline en validación.
+3. Superar a Champion, si existe, en esa misma validación, por más de `minimum_improvement`.
 
-**Proyecto final implementado y ejecutado correctamente para los componentes requeridos del curso.**
+Un Champion sin evidencia de entrenamiento anterior a 2021 bloquea la comparación. La
+prueba final no decide la promoción. No ajuste repetidamente decisiones observando sus
+resultados: las siguientes iteraciones requieren otro periodo de prueba. Solo debe haber
+una promoción en curso por modelo; esta implementación no ofrece bloqueo de alias concurrente.
+
+La inferencia desde la versión registrada se compara con el modelo seleccionado; si hubo
+promoción, también se comprueba el alias Champion. Una repetición del entrenamiento puede
+crear una nueva versión, incluso si los datos y parámetros son iguales.
+
+## Parámetros principales
+
+| Parámetro | Notebook | Predeterminado |
+|---|---|---|
+| catalog_name | Todos | accidentalidad_databricks |
+| enforce_reference_counts | Bronze / Job | true |
+| max_vehicle_orphans | Silver / Job | 3 |
+| include_ml | Job | false |
+| run_job | Job | false |
+| existing_cluster_id | Job | Vacío: serverless |
+| reader_group | Gobernanza | Vacío |
+| apply_grants / verify_reader | Gobernanza | false / false |
+| promote_champion | ML | false |
+| minimum_validation_f1 / minimum_improvement | ML | 0.5 / 0.0 |
+| max_unknown_labels | ML | 0 |
+| max_driver_rows | ML | 100000 |
+
+## Comprobaciones y evidencia
+
+Desde la raíz del repositorio, con Python 3.10 o posterior y sin dependencias externas:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+La suite cubre límites temporales, selección independiente del test, promoción,
+configuración inválida, creación/actualización de Jobs y comportamiento bloqueante de
+calidad. Simula SDK y persistencia Spark; también analiza sintácticamente los notebooks.
+GitHub Actions ejecuta estas comprobaciones en cada push y pull request.
+
+La [guía de validación en Databricks](docs/VALIDACION.md) describe las comprobaciones con
+fuentes reales. Solo después de completarla corresponde afirmar que la ejecución integral,
+los permisos y el registro del modelo están verificados. El repositorio no certifica los
+conteos originales, la disponibilidad del compute ni los permisos de un workspace concreto.
